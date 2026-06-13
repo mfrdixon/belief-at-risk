@@ -49,3 +49,13 @@ The script writes:
 ## Notes
 
 The empirical strategy is illustrative. The research contribution is the model-risk architecture: the LLM supplies uncertain evidence over latent regimes, the Bayesian filter produces auditable belief states, and risk is measured by the losses induced by actions taken under those beliefs.
+
+Please cite as:
+@article{dixon2026belief,
+  title   = {Belief at Risk: Quantifying Agentic AI Model Risk with LLM-Inferred Bayesian State Filters},
+  author  = {Dixon, Matthew},
+  journal = {arXiv preprint arXiv:2606.xxxxx},
+  year    = {2026}
+}
+
+You're need to create API keys for OpenAI and Massive.com as environmental variables.
