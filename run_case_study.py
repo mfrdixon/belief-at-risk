@@ -145,6 +145,12 @@ def fetch_massive_daily_adjusted(ticker: str, start: str, end: str, api_key: str
 
 
 def load_prices(cfg: Config) -> pd.DataFrame:
+    cache = cfg.outdir / "data" / "adjusted_close_prices.csv"
+
+    if cache.exists():
+        print(f"Reading cached prices from {cache}")
+        return pd.read_csv(cache, parse_dates=["date"]).set_index("date").sort_index()
+
     frames = []
     for i, ticker in enumerate(cfg.tickers):
         print(f"Fetching {ticker} adjusted daily bars from Massive.com...")
@@ -152,8 +158,13 @@ def load_prices(cfg: Config) -> pd.DataFrame:
         if i < len(cfg.tickers) - 1:
             print(f"Sleeping {cfg.sleep:.1f}s before next ticker call...")
             time.sleep(cfg.sleep)
+
     prices = pd.concat(frames, axis=1).sort_index().dropna(how="all")
     prices = prices.ffill().dropna()
+
+    prices.reset_index().to_csv(cache, index=False)
+    print(f"Cached prices written to {cache}")
+
     return prices
 
 
@@ -195,12 +206,14 @@ Return only calibrated probabilities over the four regimes. They must be nonnega
 Also include a one-sentence rationale. Do not recommend a trade.
 """
 
+def normalize_prob_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    x = df[cols].clip(lower=1e-12)
+    return x.div(x.sum(axis=1), axis=0)
 
-def normalize_probs(d: Dict[str, float]) -> Dict[str, float]:
+def normalize_regime_dict(d: Dict[str, float]) -> Dict[str, float]:
     vals = np.array([max(float(d.get(r, 0.0)), 1e-8) for r in REGIMES], dtype=float)
     vals = vals / vals.sum()
     return {r: float(vals[i]) for i, r in enumerate(REGIMES)}
-
 
 def llm_regime_belief(client: OpenAI, model: str, prompt: str) -> Dict[str, float]:
     """Call OpenAI Responses API with structured JSON output.
@@ -238,7 +251,7 @@ def llm_regime_belief(client: OpenAI, model: str, prompt: str) -> Dict[str, floa
     )
     txt = response.output_text
     data = json.loads(txt)
-    return normalize_probs(data)
+    return normalize_regime_dict(data)
 
 
 def heuristic_belief(row: pd.Series) -> Dict[str, float]:
@@ -355,6 +368,46 @@ def compute_strategy(features: pd.DataFrame, beliefs: pd.DataFrame) -> pd.DataFr
     out["benchmark_equity"] = (1 + bench_ret).cumprod()
     return out
 
+def macro_only_expected_returns(features, names, config):
+    mu = pd.Series(0.0, index=names)
+
+    risk_score = float(features.get("risk_score", 0.0))
+
+    for name in names:
+        if name in ["GLD", "TLT"]:
+            mu[name] += 0.03 * risk_score
+        else:
+            mu[name] -= 0.02 * risk_score
+
+    return mu
+
+
+def belief_only_expected_returns(belief, names, config):
+    mu = pd.Series(0.0, index=names)
+
+    ai_boom = float(belief.get("AI_Boom", 0.0))
+    soft = float(belief.get("Soft_Landing", 0.0))
+    inflation = float(belief.get("Inflation_Shock", 0.0))
+    recession = float(belief.get("Recession", 0.0))
+    crisis = float(belief.get("Crisis", 0.0))
+
+    for name in names:
+        if name in ["NVDA", "MSFT", "GOOGL", "AMZN"]:
+            mu[name] += 0.08 * ai_boom + 0.03 * soft
+            mu[name] -= 0.04 * recession + 0.05 * crisis
+
+        elif name in ["GLD"]:
+            mu[name] += 0.05 * inflation + 0.04 * crisis
+
+        elif name in ["TLT"]:
+            mu[name] += 0.05 * recession + 0.03 * crisis
+            mu[name] -= 0.03 * inflation
+
+        else:
+            mu[name] += 0.02 * soft
+            mu[name] -= 0.03 * recession + 0.03 * crisis
+
+    return mu
 
 def max_drawdown(equity: pd.Series) -> float:
     return float((equity / equity.cummax() - 1).min())
@@ -384,6 +437,394 @@ def perf_table(returns: pd.Series, equity: pd.Series) -> Dict[str, float]:
         "CVaR 95": cvar95,
     }
 
+def generate_ablation_study(
+    cfg: Config,
+    returns: pd.DataFrame,
+    features: pd.DataFrame,
+    beliefs: pd.DataFrame,
+) -> pd.DataFrame:
+
+    out_tables = cfg.outdir / "tables"
+    out_data = cfg.outdir / "data"
+    out_tables.mkdir(parents=True, exist_ok=True)
+    out_data.mkdir(parents=True, exist_ok=True)
+
+    q_cols = [f"q_{r}" for r in REGIMES]
+    b_cols = [f"b_{r}" for r in REGIMES]
+
+    raw = beliefs[q_cols].copy()
+    raw.columns = b_cols
+
+    filt = beliefs[b_cols].copy()
+
+    labels = realized_regime_labels(features).loc[beliefs.index]
+
+    def normalize(df):
+        x = df.clip(lower=1e-12)
+        return x.div(x.sum(axis=1), axis=0)
+
+    raw = normalize(raw)
+    filt = normalize(filt)
+
+    def entropy_df(probs):
+        k = probs.shape[1]
+        return -(probs * np.log(probs.clip(lower=1e-12))).sum(axis=1) / np.log(k)
+
+    def drift_df(probs):
+        prev = probs.shift(1)
+        d = (
+            probs
+            * np.log(probs.clip(lower=1e-12) / prev.clip(lower=1e-12))
+        ).sum(axis=1)
+        return d.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    def brier_df(probs, labels):
+        y = pd.DataFrame(0.0, index=probs.index, columns=probs.columns)
+        for r in REGIMES:
+            y.loc[labels == r, f"b_{r}"] = 1.0
+        return ((probs - y) ** 2).sum(axis=1)
+
+    def portfolio_returns_from_probs(probs):
+        exposure = (
+            probs["b_risk_on"]
+            + 0.5 * probs["b_neutral"]
+            - 0.5 * probs["b_risk_off"]
+            - probs["b_crisis"]
+        )
+        return exposure.shift(1) * returns.loc[probs.index, "SPY"]
+
+    def cvar95(x):
+        x = pd.Series(x).dropna()
+        if len(x) < 20:
+            return np.nan
+        q = x.quantile(0.05)
+        return x[x <= q].mean()
+
+    rows = []
+
+    for name, probs, kappa in [
+        ("Raw LLM evidence", raw, 0.0),
+        ("LLM + Bayesian filter", filt, 0.0),
+        ("LLM + Bayesian filter + controls", filt, 0.50),
+    ]:
+        H = entropy_df(probs)
+        D = drift_df(probs)
+        br = brier_df(probs, labels)
+
+        pr = portfolio_returns_from_probs(probs)
+        rolling_cvar = pr.rolling(60).apply(cvar95, raw=False).abs()
+        bar = H * (1.0 + D) * rolling_cvar
+        residual_bar = (1.0 - kappa) * bar
+
+        pred = probs.idxmax(axis=1).str.replace("b_", "", regex=False)
+        acc = (pred == labels).mean()
+
+        perf = annualized_performance(pr)
+
+        rows.append({
+            "Model specification": name,
+            "Mean entropy": H.mean(),
+            "Maximum entropy": H.max(),
+            "Mean KL drift": D.mean(),
+            "Maximum KL drift": D.max(),
+            "Brier score": br.mean(),
+            "Regime accuracy": acc,
+            "Mean BaR": bar.mean(),
+            "Maximum BaR": bar.max(),
+            "Mean residual BaR": residual_bar.mean(),
+            "Maximum residual BaR": residual_bar.max(),
+            "Annualized return": perf["Annualized return"],
+            "Annualized volatility": perf["Annualized volatility"],
+            "Sharpe ratio": perf["Sharpe ratio"],
+            "Maximum drawdown": perf["Maximum drawdown"],
+            "CVaR 95%": perf["CVaR 95\\%"],
+            "Control effectiveness": kappa,
+        })
+
+    ablation = pd.DataFrame(rows)
+    ablation.to_csv(out_data / "ablation_results.csv", index=False)
+
+    formatted = ablation.copy()
+    for c in formatted.columns:
+        if c != "Model specification":
+            formatted[c] = formatted[c].map(fmt3)
+
+    formatted[
+        [
+            "Model specification",
+            "Mean entropy",
+            "Maximum entropy",
+            "Mean KL drift",
+            "Maximum KL drift",
+            "Brier score",
+            "Regime accuracy",
+        ]
+    ].to_latex(
+        out_tables / "ablation_uncertainty_calibration.tex",
+        index=False,
+        escape=False,
+        caption="Ablation study comparing uncertainty, belief instability, and calibration for raw LLM evidence, Bayesian-filtered beliefs, and control-adjusted beliefs.",
+        label="tab:ablation_uncertainty_calibration",
+    )
+
+    formatted[
+        [
+            "Model specification",
+            "Mean BaR",
+            "Maximum BaR",
+            "Mean residual BaR",
+            "Maximum residual BaR",
+            "Annualized return",
+            "Annualized volatility",
+            "Sharpe ratio",
+            "Maximum drawdown",
+            "CVaR 95%",
+            "Control effectiveness",
+        ]
+    ].to_latex(
+        out_tables / "ablation_risk_performance.tex",
+        index=False,
+        escape=False,
+        caption="Ablation study comparing Belief-at-Risk, residual risk, portfolio performance, and downside consequence.",
+        label="tab:ablation_risk_performance",
+    )
+
+    return ablation
+def make_state_specs():
+    return {
+        "3-state": ["risk_on", "neutral", "stress"],
+        "4-state": ["risk_on", "neutral", "risk_off", "crisis"],
+        "5-state": ["strong_risk_on", "risk_on", "neutral", "risk_off", "crisis"],
+    }
+
+
+def transition_matrix_for_k(k: int, stay_prob: float = 0.85) -> np.ndarray:
+    P = np.zeros((k, k))
+    for i in range(k):
+        P[i, i] = stay_prob
+        if i > 0:
+            P[i, i - 1] += (1 - stay_prob) / 2
+        else:
+            P[i, i] += (1 - stay_prob) / 2
+        if i < k - 1:
+            P[i, i + 1] += (1 - stay_prob) / 2
+        else:
+            P[i, i] += (1 - stay_prob) / 2
+    return P / P.sum(axis=1, keepdims=True)
+
+
+
+def entropy_from_probs(probs: pd.DataFrame) -> pd.Series:
+    k = probs.shape[1]
+    return -(probs * np.log(probs.clip(lower=1e-12))).sum(axis=1) / np.log(k)
+
+
+def drift_from_probs(probs: pd.DataFrame) -> pd.Series:
+    prev = probs.shift(1)
+    d = (probs * np.log(probs.clip(lower=1e-12) / prev.clip(lower=1e-12))).sum(axis=1)
+    return d.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def state_action_weights(states: list[str]) -> dict[str, float]:
+    """
+    Generic ordinal action scale.
+    Highest-risk-appetite state maps to +1.
+    Most-stressed state maps to -1.
+    Intermediate states are evenly spaced.
+    """
+    vals = np.linspace(1.0, -1.0, len(states))
+    return dict(zip(states, vals))
+
+
+def heuristic_regime_probs(features: pd.DataFrame, states: list[str]) -> pd.DataFrame:
+    """
+    Robustness proxy for q_t using existing features.
+    Replace this with OpenAI calls if you want each state specification
+    to use a fresh LLM prompt.
+    """
+
+    out = pd.DataFrame(index=features.index)
+    k = len(states)
+
+    z_ret = features.get("spy_return_20d", features.iloc[:, 0]).fillna(0.0)
+    z_vol = features.get("ew_vol_20d", features.iloc[:, 0]).fillna(0.0)
+    z_dd = features.get("spy_drawdown", features.iloc[:, 0]).fillna(0.0)
+
+    # Standardize for stable scoring
+    ret = (z_ret - z_ret.mean()) / (z_ret.std() + 1e-12)
+    vol = (z_vol - z_vol.mean()) / (z_vol.std() + 1e-12)
+    dd = (z_dd - z_dd.mean()) / (z_dd.std() + 1e-12)
+
+    stress_score = -ret + vol - dd
+
+    grid = np.linspace(-1.5, 1.5, k)
+
+    scores = []
+    for g in grid:
+        scores.append(-((stress_score - g) ** 2))
+
+    scores = np.vstack(scores).T
+    scores = scores - scores.max(axis=1, keepdims=True)
+    probs = np.exp(scores)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+
+    for j, s in enumerate(states):
+        out[f"q_{s}"] = probs[:, j]
+
+    return out
+
+
+def bayesian_filter_probs(q: pd.DataFrame, states: list[str], eta: float = 0.75) -> pd.DataFrame:
+    q_cols = [f"q_{s}" for s in states]
+    q_mat = normalize_prob_frame(q, q_cols).values
+
+    k = len(states)
+    P = transition_matrix_for_k(k)
+    b_prev = np.ones(k) / k
+
+    rows = []
+    for i in range(len(q_mat)):
+        prior = P.T @ b_prev
+        post = prior * np.power(np.clip(q_mat[i], 1e-12, 1.0), eta)
+        post = post / post.sum()
+        rows.append(post)
+        b_prev = post
+
+    b = pd.DataFrame(rows, index=q.index, columns=[f"b_{s}" for s in states])
+    return b
+
+
+def realized_labels_for_states(features: pd.DataFrame, states: list[str]) -> pd.Series:
+    """
+    Creates heuristic ex-post labels by binning a stress score.
+    This keeps labels comparable across 3-, 4-, and 5-state specifications.
+    """
+
+    z_ret = features.get("spy_return_20d", features.iloc[:, 0]).fillna(0.0)
+    z_vol = features.get("ew_vol_20d", features.iloc[:, 0]).fillna(0.0)
+    z_dd = features.get("spy_drawdown", features.iloc[:, 0]).fillna(0.0)
+
+    ret = (z_ret - z_ret.mean()) / (z_ret.std() + 1e-12)
+    vol = (z_vol - z_vol.mean()) / (z_vol.std() + 1e-12)
+    dd = (z_dd - z_dd.mean()) / (z_dd.std() + 1e-12)
+
+    stress_score = -ret + vol - dd
+
+    bins = pd.qcut(stress_score, q=len(states), labels=list(reversed(states)), duplicates="drop")
+    return bins.astype(str)
+
+
+def brier_score_for_states(probs: pd.DataFrame, labels: pd.Series, states: list[str]) -> pd.Series:
+    b_cols = [f"b_{s}" for s in states]
+    y = pd.DataFrame(0.0, index=probs.index, columns=b_cols)
+
+    for s in states:
+        y.loc[labels == s, f"b_{s}"] = 1.0
+
+    return ((probs[b_cols] - y) ** 2).sum(axis=1)
+
+
+def consequence_returns_from_states(
+    probs: pd.DataFrame,
+    returns: pd.DataFrame,
+    states: list[str],
+    asset: str = "SPY",
+) -> pd.Series:
+    weights = state_action_weights(states)
+    exposure = sum(weights[s] * probs[f"b_{s}"] for s in states)
+    return exposure.shift(1) * returns.loc[probs.index, asset]
+
+
+def rolling_cvar_abs(r: pd.Series, window: int = 60, alpha: float = 0.95) -> pd.Series:
+    def cvar(x):
+        x = pd.Series(x).dropna()
+        if len(x) < 20:
+            return np.nan
+        q = x.quantile(1 - alpha)
+        return abs(x[x <= q].mean())
+
+    return r.rolling(window).apply(cvar, raw=False)
+
+
+def run_state_space_robustness(
+    cfg,
+    returns: pd.DataFrame,
+    features: pd.DataFrame,
+    eta: float = 0.75,
+    asset: str = "SPY",
+) -> pd.DataFrame:
+    """
+    Runs robustness over 3-, 4-, and 5-state specifications.
+
+    Outputs:
+      outputs/data/state_space_robustness.csv
+      outputs/tables/state_space_robustness.tex
+    """
+
+    out_tables = cfg.outdir / "tables"
+    out_data = cfg.outdir / "data"
+    out_tables.mkdir(parents=True, exist_ok=True)
+    out_data.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+
+    for spec_name, states in make_state_specs().items():
+        q = heuristic_regime_probs(features, states)
+        b = bayesian_filter_probs(q, states, eta=eta)
+
+        common_idx = returns.index.intersection(features.index).intersection(b.index)
+        b = b.loc[common_idx]
+        f = features.loc[common_idx]
+        r = returns.loc[common_idx]
+
+        labels = realized_labels_for_states(f, states).loc[common_idx]
+
+        H = entropy_from_probs(b)
+        D = drift_from_probs(b)
+        BS = brier_score_for_states(b, labels, states)
+
+        pred = b.idxmax(axis=1).str.replace("b_", "", regex=False)
+        acc = (pred == labels).mean()
+
+        cr = consequence_returns_from_states(b, r, states, asset=asset)
+        cvar = rolling_cvar_abs(cr, window=60)
+        bar = H * (1.0 + D) * cvar
+
+        rows.append({
+            "State specification": spec_name,
+            "Number of states": len(states),
+            "Mean entropy": H.mean(),
+            "Maximum entropy": H.max(),
+            "Mean KL drift": D.mean(),
+            "Maximum KL drift": D.max(),
+            "Brier score": BS.mean(),
+            "Regime accuracy": acc,
+            "Mean BaR": bar.mean(),
+            "Maximum BaR": bar.max(),
+        })
+
+    robustness = pd.DataFrame(rows)
+    robustness.to_csv(out_data / "state_space_robustness.csv", index=False)
+
+    formatted = robustness.copy()
+    for c in formatted.columns:
+        if c not in ["State specification", "Number of states"]:
+            formatted[c] = formatted[c].map(fmt3)
+
+    latex = formatted.to_latex(
+        index=False,
+        escape=False,
+        caption=(
+            "Robustness of uncertainty, belief stability, calibration, "
+            "and Belief-at-Risk across alternative latent-state specifications."
+        ),
+        label="tab:state_space_robustness",
+        column_format="lccccccccc",
+    )
+
+    (out_tables / "state_space_robustness.tex").write_text(latex)
+
+    return robustness
 
 def write_latex_table(df: pd.DataFrame, path: Path, caption: str, label: str) -> None:
     tex = df.to_latex(index=True, float_format=lambda x: f"{x:.4f}", escape=False, caption=caption, label=label)
@@ -1021,6 +1462,23 @@ def main() -> None:
     returns = np.log(prices / prices.shift(1)).dropna()
     features = compute_features(returns, prices).dropna()
     beliefs = infer_beliefs(cfg, features)
+    ablation_results = generate_ablation_study(
+            cfg=cfg,
+            returns=returns,
+            features=features,
+            beliefs=beliefs,
+        )
+
+
+    state_robustness = run_state_space_robustness(
+        cfg=cfg,
+        returns=returns,
+        features=features,
+        eta=cfg.evidence_temperature,
+        asset="SPY",
+    )
+
+    print(state_robustness)    
 
     portfolio_returns = (
     (
